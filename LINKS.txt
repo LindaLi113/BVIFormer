@@ -1,0 +1,21 @@
+# Official dataset links (fill with the exact URLs you use)
+# 公共数据集官方链接（请填写你实际使用的URL）
+# Example placeholders below; replace with authoritative sources you follow.
+
+RESIDE SOTS-Indoor:
+<PASTE OFFICIAL LINK HERE>
+
+RESIDE SOTS-Outdoor:
+<PASTE OFFICIAL LINK HERE>
+
+O-HAZE:
+<PASTE OFFICIAL LINK HERE>
+
+Dense-Haze:
+<PASTE OFFICIAL LINK HERE>
+
+Rain1400:
+<PASTE OFFICIAL LINK HERE>
+
+Test2800:
+<PASTE OFFICIAL LINK HERE>

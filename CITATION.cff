@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this artifact during review, please cite the manuscript."
+title: "<Paper Title Placeholder>"
+authors:
+  - family-names: "Anonymous"
+    given-names: "Authors"
+date-released: "2025-11-10"
+version: "review-artifact-0.1"
+license: "Evaluation-Only (Review Phase)"
+repository-code: "N/A (anonymous artifact)"
