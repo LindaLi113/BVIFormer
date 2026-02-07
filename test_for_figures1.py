@@ -11,11 +11,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from skimage.metrics import structural_similarity as ssim
 from models.bviformer import BVIFormer
+
+# ---------------------------
+# util: amp + oom chunk (for tiled path)
+# ---------------------------
 def _forward_in_chunks(model, batch, amp_inference, chunk):
     outs = []
     for s in range(0, batch.size(0), chunk):
         sub = batch[s:s+chunk]
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=amp_inference):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(amp_inference and sub.is_cuda)):
             out = model(sub).contiguous()
         outs.append(out)
         del sub, out
@@ -47,6 +51,9 @@ def _match_spatial(t: torch.Tensor, target_h: int, target_w: int) -> torch.Tenso
         return t[..., sh:sh+target_h, sw:sw+target_w]
     return F.interpolate(t, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
+# ---------------------------
+# metric / io
+# ---------------------------
 def tensor_to_uint8_rgb(t: torch.Tensor):
     """[3,H,W] -> uint8 HxWx3"""
     arr = t.detach().cpu().numpy().transpose(1, 2, 0)
@@ -100,10 +107,15 @@ def draw_text(im: Image.Image, text: str) -> Image.Image:
         draw.text((pad, pad), text, fill=(255, 255, 255), font=font)
         return im
 
+# ---------------------------
+# pairing
+# ---------------------------
 EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
+
 def find_matching_gt(hazy_path: str, gt_dir: str):
     hazy_name = os.path.basename(hazy_path)
     stem, ext = os.path.splitext(hazy_name)
+
     cand = os.path.join(gt_dir, hazy_name)
     if os.path.isfile(cand):
         return cand
@@ -113,10 +125,12 @@ def find_matching_gt(hazy_path: str, gt_dir: str):
         base = m.group(1)
     else:
         base = stem.split('_')[0]
+
     for e in EXTS:
         cand = os.path.join(gt_dir, base + e)
         if os.path.isfile(cand):
             return cand
+
     files = []
     for e in ('*',):
         files.extend(glob.glob(os.path.join(gt_dir, f"{base}.{e}")))
@@ -131,6 +145,9 @@ def find_matching_gt(hazy_path: str, gt_dir: str):
 
     return None
 
+# ---------------------------
+# tiled inference (kept as fallback / optional)
+# ---------------------------
 def forward_tiled_parallel(
     model, img,
     tile_size=512,
@@ -146,18 +163,21 @@ def forward_tiled_parallel(
     overlap_w = min(tile_overlap, max(tile_w - 1, 0))
     step_h = max(1, tile_h - overlap_h)
     step_w = max(1, tile_w - overlap_w)
+
     top_vals = list(range(0, max(1, H - tile_h + 1), step_h))
     if top_vals[-1] + tile_h < H:
         top_vals.append(H - tile_h)
     left_vals = list(range(0, max(1, W - tile_w + 1), step_w))
     if left_vals[-1] + tile_w < W:
         left_vals.append(W - tile_w)
+
     coords, tiles = [], []
     for top in top_vals:
         for left in left_vals:
             bottom, right = top + tile_h, left + tile_w
             tiles.append(img[..., top:bottom, left:right])
             coords.append((top, left, bottom, right))
+
     out = torch.zeros_like(img)
     weight = torch.zeros((1, 1, H, W), device=img.device)
 
@@ -175,22 +195,86 @@ def forward_tiled_parallel(
     while i < len(tiles):
         j = min(i + batch_tiles, len(tiles))
         batch = torch.cat(tiles[i:j], dim=0)
-        out_batch = _forward_with_oom_guard(
-            model, batch, amp_inference, init_chunk=batch.size(0)
-        )
+        out_batch = _forward_with_oom_guard(model, batch, amp_inference, init_chunk=batch.size(0))
+
         for k in range(out_batch.size(0)):
             top, left, bottom, right = coords[i + k]
             rh, rw = bottom - top, right - left
             piece = _match_spatial(out_batch[k:k+1], rh, rw)
             out[..., top:bottom, left:right] += piece
             weight[..., top:bottom, left:right] += 1.0
+
         del batch, out_batch, piece
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         i = j
+
     out = out / torch.clamp_min(weight, 1e-6)
     return out
 
+# ---------------------------
+# FULL-image inference (NEW)
+# ---------------------------
+def pad_to_mod(x: torch.Tensor, mod: int, pad_mode: str = "reflect"):
+    """
+    pad H/W to be divisible by mod; return padded_x, (pad_h, pad_w)
+    """
+    if mod is None or mod <= 1:
+        return x, (0, 0)
+
+    _, _, H, W = x.shape
+    pad_h = (mod - (H % mod)) % mod
+    pad_w = (mod - (W % mod)) % mod
+    if pad_h == 0 and pad_w == 0:
+        return x, (0, 0)
+
+    # reflect 的 pad 必须 < 输入尺寸；否则会报错。遇到小图自动改用 replicate 更稳。
+    _mode = pad_mode
+    if _mode == "reflect" and (H <= 1 or W <= 1 or pad_h >= H or pad_w >= W):
+        _mode = "replicate"
+
+    if _mode == "constant":
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=_mode, value=0.0)
+    else:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=_mode)
+    return x, (pad_h, pad_w)
+
+@torch.no_grad()
+def forward_full_image(model, img, amp_inference=False, pad_mod=1, pad_mode="reflect",
+                       oom_fallback=False, tile_size=336, tile_overlap=168, batch_tiles=8):
+    """
+    Default: full-image inference once.
+    Optional: pad to multiple (pad_mod), then crop back.
+    Optional: if CUDA OOM and oom_fallback=True -> fallback to tiled.
+    """
+    B, C, H, W = img.shape
+    assert B == 1, "Only support batch=1 input image"
+
+    x, (pad_h, pad_w) = pad_to_mod(img, pad_mod, pad_mode)
+
+    try:
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(amp_inference and x.is_cuda)):
+            y = model(x)
+    except RuntimeError as e:
+        if oom_fallback and x.is_cuda and ("out of memory" in str(e).lower() or "cuda oom" in str(e).lower()):
+            torch.cuda.empty_cache()
+            y = forward_tiled_parallel(
+                model, img,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                amp_inference=amp_inference,
+                batch_tiles=batch_tiles
+            )
+        else:
+            raise
+
+    if pad_h > 0 or pad_w > 0:
+        y = y[..., :H, :W]
+    return y
+
+# ---------------------------
+# model load
+# ---------------------------
 def adjust_state_dict_for_model(state_dict, model):
     is_dp = isinstance(model, nn.DataParallel)
     key_sample = next(iter(state_dict))
@@ -212,6 +296,9 @@ def load_model(weights_path: str, device: torch.device, dp: bool):
     model.eval()
     return model
 
+# ---------------------------
+# main
+# ---------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hazy_dir', required=True)
@@ -219,22 +306,40 @@ def main():
     parser.add_argument('--weights', required=True)
     parser.add_argument('--out_dir', required=True)
     parser.add_argument('--output_csv', required=True)
+
+    # keep tiled args (optional / fallback)
     parser.add_argument('--tile', type=int, default=336)
     parser.add_argument('--overlap', type=int, default=168)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--bf16', action='store_true', help='bfloat16')
     parser.add_argument('--batch_tiles', type=int, default=8)
+
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--bf16', action='store_true', help='bfloat16 autocast on CUDA')
+
+    # NEW: inference mode
+    parser.add_argument('--mode', choices=['full', 'tiled'], default='full',
+                        help='default full: whole-image inference once.')
+    parser.add_argument('--pad_mod', type=int, default=1,
+                        help='pad H/W to be divisible by this (e.g., 8/16/32). default 1 = no pad.')
+    parser.add_argument('--pad_mode', choices=['reflect', 'replicate', 'constant'], default='reflect')
+    parser.add_argument('--oom_fallback', action='store_true',
+                        help='if full-image inference CUDA OOM, fallback to tiled.')
+
     args = parser.parse_args()
+
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     dp = (device.type == 'cuda')
     model = load_model(args.weights, device, dp)
+
     os.makedirs(args.out_dir, exist_ok=True)
+
     hazy_list = []
     for e in EXTS:
         hazy_list += glob.glob(os.path.join(args.hazy_dir, f'*{e}'))
     hazy_list.sort()
+
     total_psnr, total_ssim, count = 0.0, 0.0, 0
     rows = [["name", "psnr", "ssim"]]
+
     with torch.no_grad():
         for hazy_path in hazy_list:
             name = os.path.basename(hazy_path)
@@ -242,35 +347,59 @@ def main():
             if gt_path is None:
                 print(f"[WARN] 未找到 GT：{name}，跳过该样本。")
                 continue
+
             hazy = Image.open(hazy_path).convert('RGB')
             gt   = Image.open(gt_path).convert('RGB')
+
             hazy_t = torch.from_numpy(np.asarray(hazy)).float().permute(2, 0, 1) / 255.0
             gt_t   = torch.from_numpy(np.asarray(gt)).float().permute(2, 0, 1) / 255.0
+
             H = min(hazy_t.shape[1], gt_t.shape[1])
             W = min(hazy_t.shape[2], gt_t.shape[2])
             hazy_t = hazy_t[:, :H, :W].unsqueeze(0).to(device, non_blocking=True)
             gt_t   = gt_t[:, :H, :W].to(device, non_blocking=True)
-            out = forward_tiled_parallel(
-                model, hazy_t,
-                tile_size=args.tile, tile_overlap=args.overlap,
-                amp_inference=args.bf16, batch_tiles=args.batch_tiles
-            ).clamp_(0, 1)
+
+            # --------- changed here: full-image inference ----------
+            if args.mode == 'full':
+                out = forward_full_image(
+                    model, hazy_t,
+                    amp_inference=args.bf16,
+                    pad_mod=args.pad_mod,
+                    pad_mode=args.pad_mode,
+                    oom_fallback=args.oom_fallback,
+                    tile_size=args.tile,
+                    tile_overlap=args.overlap,
+                    batch_tiles=args.batch_tiles
+                ).clamp_(0, 1)
+            else:
+                out = forward_tiled_parallel(
+                    model, hazy_t,
+                    tile_size=args.tile, tile_overlap=args.overlap,
+                    amp_inference=args.bf16, batch_tiles=args.batch_tiles
+                ).clamp_(0, 1)
+            # ------------------------------------------------------
+
             ps = compute_psnr(out[0], gt_t)
             ss = compute_ssim(out[0], gt_t)
+
             total_psnr += ps
             total_ssim += ss
             count += 1
+
             out_im = Image.fromarray(tensor_to_uint8_rgb(out[0]))
             out_im = draw_text(out_im, f'PSNR {ps:.2f}   SSIM {ss:.4f}')
             save_path = os.path.join(args.out_dir, os.path.splitext(name)[0] + '.png')
             out_im.save(save_path)
+
             rows.append([name, f"{ps:.4f}", f"{ss:.6f}"])
+
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
     with open(args.output_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerows(rows)
         if count > 0:
             writer.writerow(["mean", f"{total_psnr / count:.4f}", f"{total_ssim / count:.6f}"])
+
     print(f"Done. Images={count}, mean PSNR={total_psnr / max(count,1):.3f}, mean SSIM={total_ssim / max(count,1):.5f}")
     print(f"Saved to: {args.out_dir}")
     print(f"CSV: {args.output_csv}")
