@@ -3,7 +3,7 @@
 # Example placeholders below; replace with authoritative sources you follow.
 
 RESIDE SOTS-Indoor:
-<PASTE OFFICIAL LINK HERE>
+<PASTE OFFICIAL LINK HERE> 
 
 RESIDE SOTS-Outdoor:
 <PASTE OFFICIAL LINK HERE>
